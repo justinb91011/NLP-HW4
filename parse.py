@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Determine whether sentences are grammatical under a CFG, using a probabilistic Earley's algorithm.
-This parses the highest-probability(minimum-weight) parse of each given sentence
+Determine the highest probability (minimum-weight) parse of sentence under a PCFG,
+using a probabilistic Earley's algorithm
 """
 
 
@@ -66,18 +66,37 @@ class EarleyChart:
         self.profile: CounterType[str] = Counter()
 
         self.cols: List[Agenda]
+        self.found_goal_item: Optional[Item] = None
         self._run_earley()    # run Earley's algorithm to construct self.cols
 
     def accepted(self) -> bool:
         """Was the sentence accepted?
         That is, does the finished chart contain an item corresponding to a parse of the sentence?
         This method answers the recognition question, but not the parsing question."""
-        for item in self.cols[-1].all():    # the last column
-            if (item.rule.lhs == self.grammar.start_symbol   # a ROOT item in this column
-                and item.next_symbol() is None               # that is complete 
-                and item.start_position == 0):               # and started back at position 0
-                    return True
-        return False   # we didn't find any appropriate item
+        return self.found_goal_item is not None 
+    
+    def get_best_parse(self) -> Optional[Tuple[Any, float]]:
+        """Return the best parse tree and its weight, or None if no parse exists."""
+        if not self.accepted():
+            return None
+        else:
+            return (self._build_tree(self.found_goal_item), self.found_goal_item.weight)
+
+    def _build_tree(self, item: Item) -> Any:
+        """Recursively build the parse tree from the backpointers."""
+        if item.backpointers is None:
+            # This is a predicted item (no backpointers), should not happen for completed items
+            return (item.rule.lhs,)
+        elif len(item.backpointers) == 0:
+            # This is a terminal
+            return (item.rule.lhs, self.tokens[item.start_position])
+        else:
+            # Non-terminal with backpointers
+            children = []
+            for bp in item.backpointers:
+                children.append(self._build_tree(bp))
+            return (item.rule.lhs, *children) 
+
 
     def _run_earley(self) -> None:
         """Fill in the Earley chart."""
@@ -87,12 +106,7 @@ class EarleyChart:
         # Start looking for ROOT at position 0
         self._predict(self.grammar.start_symbol, 0)
 
-        # We'll go column by column, and within each column row by row.
-        # Processing earlier entries in the column may extend the column
-        # with later entries, which will be processed as well.
-        # 
-        # The iterator over numbered columns is `enumerate(self.cols)`.  
-        # Wrapping this iterator in the `tqdm` call provides a progress bar.
+        # Process the columns
         for i, column in tqdm.tqdm(enumerate(self.cols),
                                    total=len(self.cols),
                                    disable=not self.progress):
@@ -104,7 +118,12 @@ class EarleyChart:
                 if next is None:
                     # Attach this complete constituent to its customers
                     log.debug(f"{item} => ATTACH")
-                    self._attach(item, i)   
+                    self._attach(item, i)
+                    # Check if this is a completed ROOT spanning the whole input
+                    if (item.rule.lhs == self.grammar.start_symbol and item.start_position == 0 and i == len(self.tokens)):
+                        # Found a complete parse
+                        if (self.found_goal_item is None or item.weight < self.found_goal_item.weight):
+                            self.found_goal_item = item
                 elif self.grammar.is_nonterminal(next):
                     # Predict the nonterminal after the dot
                     log.debug(f"{item} => PREDICT")
@@ -126,7 +145,9 @@ class EarleyChart:
         """Attach the next word to this item that ends at position, 
         if it matches what this item is looking for next."""
         if position < len(self.tokens) and self.tokens[position] == item.next_symbol():
-            new_item = item.with_dot_advanced()
+            new_item = item.advance(dot_position=item.dot_position + 1,
+                                    weight=item.weight,
+                                    backpointers=[item])
             self.cols[position + 1].push(new_item)
             log.debug(f"\tScanned to get: {new_item} in column {position+1}")
             self.profile["SCAN"] += 1
@@ -139,7 +160,10 @@ class EarleyChart:
         mid = item.start_position   # start position of this item = end position of item to its left
         for customer in self.cols[mid].all():  # could you eliminate this inefficient linear search?
             if customer.next_symbol() == item.rule.lhs:
-                new_item = customer.with_dot_advanced()
+                new_weight = customer.weight + item.weight
+                new_item = customer.advance(dot_position=customer.dot_position + 1,
+                                            weight=new_weight,
+                                            backpointers=customer.backpointers + [item])
                 self.cols[position].push(new_item)
                 log.debug(f"\tAttached to get: {new_item} in column {position}")
                 self.profile["ATTACH"] += 1
@@ -207,10 +231,17 @@ class Agenda:
         return len(self._items) - self._next
 
     def push(self, item: Item) -> None:
-        """Add (enqueue) the item, unless it was previously added."""
-        if item not in self._index:    # O(1) lookup in hash table
+        """Add (enqueue) the item, handling duplicates with lower weights."""
+        key = item.get_key()
+        existing_item = self._index.get(key)
+        if existing_item is None:
             self._items.append(item)
-            self._index[item] = len(self._items) - 1
+            self._index[key] = item 
+        elif item.weight < existing_item.weight:
+            # Found a better (lower weight) item
+            self._index[key] = item
+            # Re-insert the item into the agenda for reprocessing
+            self._items.append(item)
             
     def pop(self) -> Item:
         """Returns one of the items that was waiting to be popped (dequeued).
@@ -237,7 +268,7 @@ class Grammar:
         """Create a grammar with the given start symbol, 
         adding rules from the specified files if any."""
         self.start_symbol = start_symbol
-        self._expansions: Dict[str, List[Rule]] = {}    # maps each LHS to the list of rules that expand it
+        self._expansions: Dict[str, List[Rule]] = defaultdict(list)    # maps each LHS to the list of rules that expand it
         # Read the input grammar files
         for file in files:
             self.add_rules_from_file(file)
@@ -257,9 +288,8 @@ class Grammar:
                 _prob, lhs, _rhs = line.split("\t")
                 prob = float(_prob)
                 rhs = tuple(_rhs.split())  
-                rule = Rule(lhs=lhs, rhs=rhs, weight=-math.log2(prob))
-                if lhs not in self._expansions:
-                    self._expansions[lhs] = []
+                weight = -math.log2(prob) 
+                rule = Rule(lhs=lhs, rhs=rhs, weight=weight)
                 self._expansions[lhs].append(rule)
 
     def expansions(self, lhs: str) -> Iterable[Rule]:
@@ -300,16 +330,26 @@ class Rule:
         # Note: You might want to modify this to include the weight.
         return f"{self.lhs} → {' '.join(self.rhs)}"
 
+
+@dataclass(frozen=True)
+class ItemKey:
+    """A key for items, used to detect duplicates."""
+    rule: Rule
+    dot_position: int
+    start_position: int
+
     
 # We particularly want items to be immutable, since they will be hashed and 
 # used as keys in a dictionary (for duplicate detection).  
-@dataclass(frozen=True)
+@dataclass()
 class Item:
     """An item in the Earley parse chart, representing one or more subtrees
     that could yield a particular substring."""
     rule: Rule
     dot_position: int
     start_position: int
+    weight: float
+    backpointers: Optional[List[Item]] = None
     # We don't store the end_position, which corresponds to the column
     # that the item is in, although you could store it redundantly for 
     # debugging purposes if you wanted.
@@ -322,11 +362,27 @@ class Item:
         else:
             return self.rule.rhs[self.dot_position]
 
-    def with_dot_advanced(self) -> Item:
+    def advance(self, dot_position: int, weight: float, backpointers: List[Item]) -> Item:
         if self.next_symbol() is None:
             raise IndexError("Can't advance the dot past the end of the rule")
-        return Item(rule=self.rule, dot_position=self.dot_position + 1, start_position=self.start_position)
+        return Item(rule=self.rule,
+                    dot_position=dot_position,
+                    start_position=self.start_position,
+                    weight=weight,
+                    backpointers=backpointers)
 
+    def __hash__(self):
+        return hash((self.rule, self.dot_position, self.start_position))
+
+    def get_key(self) -> ItemKey:
+        """Return a hashable key for this item, used for duplicate detection."""
+        return ItemKey(self.rule, self.dot_position, self.start_position) 
+
+
+    def __eq__(self, other):
+        return (self.rule == other.rule and
+                self.dot_position == other.dot_position and
+                self.start_position == other.start_position)
     def __repr__(self) -> str:
         """Human-readable representation string used when printing this item."""
         # Note: If you revise this class to change what an Item stores, you'll probably want to change this method too.
@@ -335,6 +391,19 @@ class Item:
         rhs.insert(self.dot_position, DOT)
         dotted_rule = f"{self.rule.lhs} → {' '.join(rhs)}"
         return f"({self.start_position}, {dotted_rule})"  # matches notation on slides
+
+
+
+def format_tree(tree) -> str:
+    """Format the parse tree in the required output format."""
+    if len(tree) == 2 and isinstance(tree[1], str):
+        # Terminal node
+        return f"({tree[0]} {tree[1]})"
+    else:
+        # Non-terminal node
+        children = ' '.join(format_tree(child) for child in tree[1:])
+        return f"({tree[0]} {children})"
+
 
 
 def main():
@@ -351,11 +420,16 @@ def main():
                 # analyze the sentence
                 log.debug("="*70)
                 log.debug(f"Parsing sentence: {sentence}")
-                chart = EarleyChart(sentence.split(), grammar, progress=args.progress)
+                tokens = sentence.split()
+                chart = EarleyChart(tokens, grammar, progress=args.progress)
                 # print the result
-                print(
-                    f"'{sentence}' is {'accepted' if chart.accepted() else 'rejected'} by {args.grammar}"
-                )
+                result = chart.get_best_parse()
+                if result is None:
+                    print("NONE")
+                else:
+                    tree, weight = result
+                    print(format_tree(tree))
+                    print(f"{weight}")
                 log.debug(f"Profile of work done: {chart.profile}")
 
 
