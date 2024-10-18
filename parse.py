@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Determine the highest-probability (minimum-weight) parse of sentences under a PCFG,
+Determine the highest-probability (minimum-weight) parse of sentences under a CFG,
 using a probabilistic Earley's algorithm.
 """
 
