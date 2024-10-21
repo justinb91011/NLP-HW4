@@ -137,11 +137,17 @@ class EarleyChart:
 
     def _predict(self, nonterminal: str, position: int) -> None:
         """Start looking for this nonterminal at the given position."""
+        if not hasattr(self, '_predicted'):
+            self._predicted = defaultdict(set)
+        if nonterminal in self._predicted[position]:
+            return 
+        
         for rule in self.grammar.expansions(nonterminal):
             new_item = Item(rule=rule, dot_position=0, start_position=position, weight=rule.weight)
             self.cols[position].push(new_item)
             log.debug(f"\tPredicted: {new_item} in column {position}")
             self.profile["PREDICT"] += 1
+        self._predicted[position].add(nonterminal)
 
     def _scan(self, item: Item, position: int) -> None:
         """Attach the next word to this item that ends at position,
@@ -174,10 +180,11 @@ class EarleyChart:
 class Agenda:
     """An agenda of items that need to be processed."""
 
-    def __init__(self) -> None:
+    def __init__(self, threshold: float = None) -> None:
         self._items: List[Item] = []
         self._index: Dict[ItemKey, Item] = {}
         self._next = 0
+        self.threshold = threshold
 
     def __len__(self) -> int:
         """Returns number of items that are still waiting to be popped."""
@@ -185,6 +192,9 @@ class Agenda:
 
     def push(self, item: Item) -> None:
         """Add (enqueue) the item, handling duplicates with lower weights."""
+        if self.threshold is not None and item.weight > self.threshold:
+            return  # Skip low-probability items
+
         key = item.get_key()
         existing_item = self._index.get(key)
         if existing_item is None:
@@ -246,9 +256,19 @@ class Grammar:
                 rule = Rule(lhs=lhs, rhs=rhs, weight=weight)
                 self._expansions[lhs].append(rule)
 
+    def specialize_to_sentence(self, tokens: List[str]) -> None:
+        """Temporarily specialize the grammar by removing rules with terminals not in the sentence."""
+        self.valid_terminals = set(tokens)
+        self._filtered_expansions = defaultdict(list)
+
+        for lhs, rules in self._expansions.items():
+            for rule in rules:
+                if all(sym in self.valid_terminals or self.is_nonterminal(sym) for sym in rule.rhs):
+                    self._filtered_expansions[lhs].append(rule)
+
     def expansions(self, lhs: str) -> Iterable[Rule]:
-        """Return an iterable collection of all rules with a given lhs"""
-        return self._expansions[lhs]
+        """Return an iterable collection of rules with a given lhs, specialized to the sentence."""
+        return self._filtered_expansions[lhs]
 
     def is_nonterminal(self, symbol: str) -> bool:
         """Is symbol a nonterminal symbol?"""
@@ -354,6 +374,7 @@ def main():
                 log.debug("="*70)
                 log.debug(f"Parsing sentence: {sentence}")
                 tokens = sentence.split()
+                grammar.specialize_to_sentence(tokens)
                 chart = EarleyChart(tokens, grammar, progress=args.progress)
                 # Print the result
                 result = chart.get_best_parse()
