@@ -9,6 +9,7 @@ import argparse
 import logging
 import math
 import tqdm
+import heapq
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections import Counter, defaultdict
@@ -175,13 +176,13 @@ class Agenda:
     """An agenda of items that need to be processed."""
 
     def __init__(self) -> None:
-        self._items: List[Item] = []
+        self._heap: List[Tuple[float, int, Item]] = []
         self._index: Dict[ItemKey, Item] = {}
-        self._next = 0
+        self._counter = 0  # Unique sequence count to avoid comparison issues
 
     def __len__(self) -> int:
         """Returns number of items that are still waiting to be popped."""
-        return len(self._items) - self._next
+        return len(self._heap)
 
     def push(self, item: Item) -> None:
         """Add (enqueue) the item, handling duplicates with lower weights."""
@@ -189,20 +190,21 @@ class Agenda:
         existing_item = self._index.get(key)
         if existing_item is None:
             # New item
-            self._items.append(item)
+            heapq.heappush(self._heap, (item.weight, self._counter, item))
             self._index[key] = item
+            self._counter += 1
         elif item.weight < existing_item.weight:
             # Found a better (lower weight) item
             self._index[key] = item
-            # Re-insert the item into the agenda for reprocessing
-            self._items.append(item)
+            # Re-insert the item into the heap for reprocessing
+            heapq.heappush(self._heap, (item.weight, self._counter, item))
+            self._counter += 1
 
     def pop(self) -> Item:
         """Returns one of the items that was waiting to be popped (dequeued)."""
         if len(self) == 0:
             raise IndexError
-        item = self._items[self._next]
-        self._next += 1
+        _, _, item = heapq.heappop(self._heap)
         return item
 
     def all(self) -> Iterable[Item]:
@@ -211,8 +213,7 @@ class Agenda:
 
     def __repr__(self):
         """Provide a human-readable string representation of this Agenda."""
-        next = self._next
-        return f"{self.__class__.__name__}({self._items[:next]}; {self._items[next:]})"
+        return f"{self.__class__.__name__}({self._heap})"
 
 
 class Grammar:
