@@ -61,7 +61,7 @@ class EarleyChart:
         """Create the chart based on parsing `tokens` with `grammar`.
         `progress` says whether to display progress bars as we parse."""
         self.tokens = tokens
-        self.grammar = grammar
+        self.grammar = grammar.filter_terminals(tokens)
         self.progress = progress
         self.profile: CounterType[str] = Counter()
 
@@ -138,11 +138,17 @@ class EarleyChart:
 
     def _predict(self, nonterminal: str, position: int) -> None:
         """Start looking for this nonterminal at the given position."""
+        if nonterminal in self.cols[position].predicted_nonterminals:
+                return
+        self.cols[position].predicted_nonterminals.add(nonterminal)
         for rule in self.grammar.expansions(nonterminal):
+            if rule.weight > self.cols[position].pruning_threshold:
+                continue  # Skip items that are below the threshold
             new_item = Item(rule=rule, dot_position=0, start_position=position, weight=rule.weight)
             self.cols[position].push(new_item)
             log.debug(f"\tPredicted: {new_item} in column {position}")
             self.profile["PREDICT"] += 1
+
 
     def _scan(self, item: Item, position: int) -> None:
         """Attach the next word to this item that ends at position,
@@ -163,6 +169,8 @@ class EarleyChart:
         for customer in self.cols[mid].all():
             if customer.next_symbol() == item.rule.lhs:
                 new_weight = customer.weight + item.weight
+                if new_weight > self.cols[position].pruning_threshold:
+                    continue 
                 new_backpointers = customer.backpointers + [item]
                 new_item = customer.advance(dot_position=customer.dot_position + 1,
                                             weight=new_weight,
@@ -175,10 +183,12 @@ class EarleyChart:
 class Agenda:
     """An agenda of items that need to be processed."""
 
-    def __init__(self) -> None:
+    def __init__(self, pruning_threshold: float = float('inf')) -> None:
         self._heap: List[Tuple[float, int, Item]] = []
         self._index: Dict[ItemKey, Item] = {}
         self._counter = 0  # Unique sequence count to avoid comparison issues
+        self.predicted_nonterminals: set[str] = set()
+        self.pruning_threshold = pruning_threshold
 
     def __len__(self) -> int:
         """Returns number of items that are still waiting to be popped."""
@@ -254,6 +264,16 @@ class Grammar:
     def is_nonterminal(self, symbol: str) -> bool:
         """Is symbol a nonterminal symbol?"""
         return symbol in self._expansions
+    
+    def filter_terminals(self, tokens: List[str]) -> Grammar:
+        """Create a specialized grammar containing only terminals found in the sentence."""
+        valid_terminals = set(tokens)
+        specialized_grammar = Grammar(self.start_symbol)
+        for lhs, rules in self._expansions.items():
+            for rule in rules:
+                if all(symbol in valid_terminals or self.is_nonterminal(symbol) for symbol in rule.rhs):
+                    specialized_grammar._expansions[lhs].append(rule)
+        return specialized_grammar
 
 
 @dataclass(frozen=True)
